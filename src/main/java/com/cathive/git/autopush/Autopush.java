@@ -6,7 +6,6 @@ import org.eclipse.jgit.api.errors.GitAPIException;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
-import org.springframework.context.annotation.PropertySource;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.annotation.Scheduled;
 
@@ -23,25 +22,46 @@ import static java.nio.file.Files.exists;
 import static java.nio.file.Files.isDirectory;
 import static org.eclipse.jgit.api.ListBranchCommand.ListMode.REMOTE;
 
+/**
+ * Autopush is an application that performs scheduled commits of a repository and pushes all changes to a remote
+ * repository. It is meant to be a convenient cross-platform-application for backup purposes using git.
+ *
+ * @author Alexander Erben
+ */
 @SpringBootApplication
 @EnableScheduling
-@PropertySource(value = "classpath:/application.properties")
 public class Autopush {
 
     private static Logger LOG = Logger.getLogger(Autopush.class.getCanonicalName());
 
+    /**
+     * This value has no default. Provide it as a command line parameter.
+     */
     @Value("${repository.path}")
     private String repositoryPath;
 
+    /**
+     * The default of this value is "origin". Set it in the CLI parameter if this default is not suitable.
+     */
     @Value("${remote.name}")
     private String remoteName;
 
+    /**
+     * The default of this value is "master". Set it in the CLI parameter if this default is not suitable.
+     */
     @Value("${remote.branch}")
     private String branchName;
 
+    /**
+     * The cron expression for the interval of autopush attempts. Defaults to * * *\3 * *, thus every three hours.
+     * The expression consists of 6 components starting with seconds.
+     */
     @Value("${interval.cron}")
     private String intervalCron;
 
+    /**
+     * Reference to the git repository to autopush
+     */
     private Git repository;
 
     public static void main(String[] args) {
