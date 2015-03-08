@@ -1,135 +1,132 @@
 package com.cathive.git.autopush;
 
 import com.google.common.base.Throwables;
-import com.google.common.collect.Sets;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.errors.GitAPIException;
-import org.eclipse.jgit.revwalk.RevCommit;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.PropertySource;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.annotation.Scheduled;
 
+import javax.annotation.PostConstruct;
 import java.io.IOException;
 import java.nio.file.Path;
-import java.time.Duration;
-import java.time.Instant;
-import java.util.Set;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
+import java.nio.file.Paths;
+import java.util.logging.Logger;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
-import static com.google.common.collect.Iterables.isEmpty;
+import static java.lang.String.format;
 import static java.nio.file.Files.exists;
 import static java.nio.file.Files.isDirectory;
-import static java.time.Instant.now;
-import static java.util.Objects.requireNonNull;
-import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static org.eclipse.jgit.api.ListBranchCommand.ListMode.REMOTE;
 
+@SpringBootApplication
+@EnableScheduling
+@PropertySource(value = "classpath:/application.properties")
 public class Autopush {
 
-    /**
-     * Keeps references to running autopushs to prevent garbage collection
-     */
-    private final static Set<Autopush> INSTANCES = Sets.newConcurrentHashSet();
+    private static Logger LOG = Logger.getLogger(Autopush.class.getCanonicalName());
 
-    private final Duration period;
-    private final Git repository;
-    private final ScheduledThreadPoolExecutor scheduledThreadPoolExecutor;
+    @Value("${repository.path}")
+    private String repositoryPath;
 
-    /**
-     * Create a new autopush instance.
-     * Preconditions:
-     * <ul>
-     *     <li>The given duration must not be null</li>
-     *     <li>The given directory path must not be null and point to an existing directory.
-     *     The directory must contain a git repository with at least one commit.</li>
-     * </ul>
-     *
-     * Autopush will perform one initial add, commit and push if changes have been detected and
-     * the remote repository has not been updated for longer than the passed period.
-     * Afterwards, autopush will repeat the automatic add, commit and push after the passed period until
-     * {@link #shutdown(boolean)} is called.
-     *
-     * @param period time that has to pass after the last commit of the upstream repository until a new commit and push is performed
-     * @param directory directory containing the git repository clone
-     */
-    public Autopush(final Duration period, final Path directory) {
-        // Preconditions
-        requireNonNull(period, "Delta must not be null!");
-        checkArgument(period.toMinutes() > 1, "Delta must be at least one minute!");
-        requireNonNull(directory, "Directory to push must not be null!");
-        checkArgument(exists(directory), "Directory to push must exist!");
-        checkArgument(isDirectory(directory), "Path to directory to push must point to directory!");
+    @Value("${remote.name}")
+    private String remoteName;
 
-        this.repository = verifyRepository(directory);
-        this.period = period;
-        this.scheduledThreadPoolExecutor = new ScheduledThreadPoolExecutor(1);
+    @Value("${remote.branch}")
+    private String branchName;
 
-        push(); // initial push to assert at least one execution before shutdown
+    @Value("${interval.cron}")
+    private String intervalCron;
 
-        this.scheduledThreadPoolExecutor.scheduleAtFixedRate(this::push, period.toMillis(), period.toMillis(), MILLISECONDS);
-        INSTANCES.add(this);
+    private Git repository;
+
+    public static void main(String[] args) {
+        SpringApplication.run(Autopush.class, args);
     }
 
     /**
-     * Perform an orderly shutdown of this autopush, finishing a possibly running push operation.
-     * @param awaitTermination should the execution block until the last push completes?
-     * @throws InterruptedException if the termination is interrupted
+     * Setup the {@link org.eclipse.jgit.api.Git}-repository.
+     * Preconditions: the configured repository.path points to an existing directory containing a non-bare
+     * git repository. A remote repository by the name given in the value remote.name must exist and a remote tracking
+     * branch by the name of the value remote.branch must exist.
+     * @throws IOException
+     * @throws GitAPIException
      */
-    public void shutdown(final boolean awaitTermination) throws InterruptedException {
-        this.scheduledThreadPoolExecutor.shutdown();
-        if (awaitTermination) this.scheduledThreadPoolExecutor.awaitTermination(5, TimeUnit.MINUTES);
-        INSTANCES.remove(this);
+    @PostConstruct
+    public void setupRepository() throws IOException, GitAPIException {
+        final Path path = Paths.get(this.repositoryPath);
+        checkArgument(exists(path) && isDirectory(path), "Directory to push must exist! Was: " + this.repositoryPath);
+        this.repository = Git.open(path.toFile());
+        checkState(this.repository
+                        .branchList()
+                        .setListMode(REMOTE)
+                        .call().stream()
+                        .allMatch((ref) -> ref.getName().contains(this.remoteName + "/" + this.branchName)),
+                format("Repository does not contain a remote \"%s\" with branch \"%s\"",
+                        this.remoteName, this.branchName));
+        autopush(); // test setup and perform one push
     }
 
     /**
-     * Precondition check to assert that the given directory contains a valid git repository with at least one commit.
-     * @param directory that should contain the git repository
-     * @return instance derived from the path
+     * Check if the working copy of the specified repository contains changes.
+     * Add them to the index if present, perform a commit and perform a push to the remote repository.
      */
-    private Git verifyRepository(final Path directory) {
+    @Scheduled(cron = "${interval.cron}")
+    public void autopush() {
         try {
-            final Git repository = Git.open(directory.toFile());
-            checkState(!isEmpty(repository.log().call()), "Repository does not have a commit!");
-            return repository;
-        } catch (final IOException e) {
-            throw new IllegalArgumentException("Could not open repository from path " + directory.toString(), e);
-        } catch (final GitAPIException e) {
-            throw Throwables.propagate(e);
-        }
-    }
-
-    private void push() {
-        try {
+            LOG.info("Validating access to remote repository.");
             this.repository.fetch().call();
             if (repositoryChanged()) {
-                if (durationSinceLastCommit().compareTo(this.period) > 0) {
-                    this.repository.add()
-                            .addFilepattern("*")
-                            .call();
-                    this.repository.commit()
-                            .setMessage("Commit by autopush")
-                            .setAuthor("autopush", "autopush@github.com")
-                            .call();
-                    this.repository.push().call();
-                }
+                LOG.info("Changes detected in repository.");
+                addAll();
+                commit();
+                push();
+                LOG.info("Successfully updated remote repository.");
+            } else {
+                LOG.info("Remote repository is up to date!");
             }
-        } catch (final Exception e) {
-            Throwables.propagate(e);
+        } catch (final GitAPIException e) {
+            LOG.severe(Throwables.getStackTraceAsString(e));
+            throw new RuntimeException(e);
         }
     }
 
-    private boolean repositoryChanged() throws GitAPIException {
-        return !this.repository.status().call().isClean();
+    /**
+     * Add all files to the index
+     */
+    private void addAll() throws GitAPIException {
+        this.repository.add()
+                .addFilepattern(".")
+                .call();
     }
 
-    private Duration durationSinceLastCommit() throws GitAPIException {
-        final RevCommit lastCommit =
-                this.repository
-                        .log()
-                        .call()
-                        .iterator()
-                        .next();
+    /**
+     * Perform a git commit with default author and message strings
+     */
+    private void commit() throws GitAPIException {
+        this.repository.commit()
+                .setMessage("Commit by autopush")
+                .setAuthor("autopush", "autopush@github.com")
+                .call();
+    }
 
-        final Instant lastCommitTime = Instant.ofEpochMilli(lastCommit.getCommitTime());
-        return Duration.between(lastCommitTime, now());
+    /**
+     * Push the master to the remote repository
+     */
+    private void push() throws GitAPIException {
+        this.repository.push().call();
+    }
+
+    /**
+     * Check if the working copy is not clean, meaning that changes happened to the working copy
+     * making an update of the remote branch necessary.
+     * @return {@link true} if the working copy contains changes, {@link false} if not.
+     */
+    private boolean repositoryChanged() throws GitAPIException {
+        return !this.repository.status().call().isClean();
     }
 }
